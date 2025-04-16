@@ -130,21 +130,6 @@ def insert_tweet(connection,tweet):
     # this ensures that a tweet does not get "partially" loaded
 
 
-    engine = sqlalchemy.create_engine(args.db, connect_args={
-        'application_name': 'load_tweets.py',
-    })
-
-    # gather your inputs
-    zip_files = args.inputs  # or glob/glob‑style sort
-
-    # open one transaction for all inserts
-    with engine.begin() as conn:
-        for f in zip_files:
-            for tweet in load_from_zip(f):
-                insert_tweet(conn, tweet)
-    # exiting the with‑block commits once (or rolls back on error)
-
-
         ########################################
         # insert into the users table
         ########################################
@@ -472,7 +457,7 @@ def insert_tweet(connection,tweet):
 
 
 if __name__ == '__main__':
-    import argparse, glob
+    import argparse, zipfile, io, json, datetime
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--db', required=True)
@@ -482,37 +467,34 @@ if __name__ == '__main__':
         required=True,
         help='paths to your geoTwitter*.zip files'
     )
+    parser.add_argument('--print_every', type=int, default=1000)
     args = parser.parse_args()
 
+    # Create the SQLAlchemy engine
     engine = sqlalchemy.create_engine(
         args.db,
         connect_args={'application_name': 'load_tweets.py'}
     )
 
-    # Run _one_ big transaction over all your ZIPs:
+    # One big transaction for everything
     with engine.begin() as conn:
-        for zip_path in args.inputs:
-            print("Loading", zip_path)
-            for tweet in load_from_zip(zip_path):
-                insert_tweet(conn, tweet)
-    # Exiting this block issues a single COMMIT (or rollback on error)
+        # Reverse sort reduces dead tuples in users table
+        for filename in sorted(args.inputs, reverse=True):
+            print(datetime.datetime.now(), "Loading", filename)
+            with zipfile.ZipFile(filename, 'r') as archive:
+                for subfile in sorted(archive.namelist(), reverse=True):
+                    with io.TextIOWrapper(archive.open(subfile)) as f:
+                        for i, line in enumerate(f):
+                            tweet = json.loads(line)
+                            insert_tweet(conn, tweet)
 
+                            # progress indicator
+                            if i % args.print_every == 0:
+                                print(
+                                    datetime.datetime.now(),
+                                    filename, subfile,
+                                    'i=', i,
+                                    'id=', tweet['id']
+                                )
+    # exiting the with‑block issues a single COMMIT (or rollback on error)
 
-# loop through the input file
-    # NOTE:
-    # we reverse sort the filenames because this results in fewer updates to the users table,
-    # which prevents excessive dead tuples and autovacuums
-    for filename in sorted(args.inputs, reverse=True):
-        with zipfile.ZipFile(filename, 'r') as archive: 
-            print(datetime.datetime.now(),filename)
-            for subfilename in sorted(archive.namelist(), reverse=True):
-                with io.TextIOWrapper(archive.open(subfilename)) as f:
-                    for i,line in enumerate(f):
-
-                        # load and insert the tweet
-                        tweet = json.loads(line)
-                        insert_tweet(connection,tweet)
-
-                        # print message
-                        if i%args.print_every==0:
-                            print(datetime.datetime.now(),filename,subfilename,'i=',i,'id=',tweet['id'])
