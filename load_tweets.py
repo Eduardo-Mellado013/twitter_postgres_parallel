@@ -82,6 +82,20 @@ def clean_dict(d):
     else:
         return d
 
+import zipfile, io, json
+
+def load_from_zip(path):
+    """
+    Given a .zip file containing one or more .jsonl tweet dumps,
+    yield each tweet (as a dict).
+    """
+    with zipfile.ZipFile(path) as z:
+        for member in z.namelist():
+            with z.open(member) as f:
+                for raw in f:
+                    yield json.loads(raw)
+
+
 def insert_tweet(connection,tweet):
     '''
     Insert the tweet into the database.
@@ -456,23 +470,35 @@ def insert_tweet(connection,tweet):
 # main functions
 ################################################################################
 
+
 if __name__ == '__main__':
-    
-    # process command line args
-    import argparse
+    import argparse, glob
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--db',required=True)
-    parser.add_argument('--inputs',nargs='+',required=True)
-    parser.add_argument('--print_every',type=int,default=1000)
+    parser.add_argument('--db', required=True)
+    parser.add_argument(
+        '--inputs',
+        nargs='+',
+        required=True,
+        help='paths to your geoTwitter*.zip files'
+    )
     args = parser.parse_args()
 
-    # create database connection
-    engine = sqlalchemy.create_engine(args.db, connect_args={
-        'application_name': 'load_tweets.py',
-        })
-    connection = engine.connect()
+    engine = sqlalchemy.create_engine(
+        args.db,
+        connect_args={'application_name': 'load_tweets.py'}
+    )
 
-    # loop through the input file
+    # Run _one_ big transaction over all your ZIPs:
+    with engine.begin() as conn:
+        for zip_path in args.inputs:
+            print("Loading", zip_path)
+            for tweet in load_from_zip(zip_path):
+                insert_tweet(conn, tweet)
+    # Exiting this block issues a single COMMIT (or rollback on error)
+
+
+# loop through the input file
     # NOTE:
     # we reverse sort the filenames because this results in fewer updates to the users table,
     # which prevents excessive dead tuples and autovacuums
