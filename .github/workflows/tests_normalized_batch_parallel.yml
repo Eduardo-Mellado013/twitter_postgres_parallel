@@ -16,10 +16,10 @@ jobs:
       run: |
         git submodule init
         git submodule update
-        docker-compose up -d --build
+        docker compose up -d --build
         docker ps -a
         sleep 20
         ./load_tweets_parallel.sh
-        docker-compose exec -T pg_normalized_batch ./run_tests.sh
+        docker compose exec -T pg_normalized_batch ./run_tests.sh
 
 
