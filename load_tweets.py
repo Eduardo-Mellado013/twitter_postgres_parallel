@@ -114,8 +114,22 @@ def insert_tweet(connection,tweet):
 
     # insert tweet within a transaction;
     # this ensures that a tweet does not get "partially" loaded
-    connection.commit()
-    with connection.begin() as trans:
+
+
+    engine = sqlalchemy.create_engine(args.db, connect_args={
+        'application_name': 'load_tweets.py',
+    })
+
+    # gather your inputs
+    zip_files = args.inputs  # or glob/glob‑style sort
+
+    # open one transaction for all inserts
+    with engine.begin() as conn:
+        for f in zip_files:
+            for tweet in load_from_zip(f):
+                insert_tweet(conn, tweet)
+    # exiting the with‑block commits once (or rolls back on error)
+
 
         ########################################
         # insert into the users table
