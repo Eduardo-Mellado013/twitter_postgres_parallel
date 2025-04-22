@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+!/usr/bin/python3
 
 # imports
 import sqlalchemy
@@ -82,20 +82,6 @@ def clean_dict(d):
     else:
         return d
 
-import zipfile, io, json
-
-def load_from_zip(path):
-    """
-    Given a .zip file containing one or more .jsonl tweet dumps,
-    yield each tweet (as a dict).
-    """
-    with zipfile.ZipFile(path) as z:
-        for member in z.namelist():
-            with z.open(member) as f:
-                for raw in f:
-                    yield json.loads(raw)
-
-
 def insert_tweet(connection,tweet):
     '''
     Insert the tweet into the database.
@@ -114,13 +100,13 @@ def insert_tweet(connection,tweet):
 
     # skip tweet if it's already inserted
     sql=sqlalchemy.sql.text('''
-        SELECT id_tweets 
-        FROM tweets
-        WHERE id_tweets = :id_tweets
+    SELECT id_tweets 
+    FROM tweets
+    WHERE id_tweets = :id_tweets
     ''')
     res = connection.execute(sql,{
-            'id_tweets':tweet['id'],
-            })
+        'id_tweets':tweet['id'],
+        })
     if res.first() is not None:
         return
     
@@ -128,15 +114,16 @@ def insert_tweet(connection,tweet):
 
     # insert tweet within a transaction;
     # this ensures that a tweet does not get "partially" loaded
-
+    connection.commit()
+    with connection.begin() as trans:
 
         ########################################
         # insert into the users table
         ########################################
-    if tweet['user']['url'] is None:
-        user_id_urls = None
-    else:
-        user_id_urls = get_id_urls(tweet['user']['url'], connection)
+        if tweet['user']['url'] is None:
+            user_id_urls = None
+        else:
+            user_id_urls = get_id_urls(tweet['user']['url'], connection)
 
         # create/update the user
         sql = sqlalchemy.sql.text('''
@@ -455,46 +442,37 @@ def insert_tweet(connection,tweet):
 # main functions
 ################################################################################
 
-
 if __name__ == '__main__':
-    import argparse, zipfile, io, json, datetime
-
+    
+    # process command line args
+    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--db', required=True)
-    parser.add_argument(
-        '--inputs',
-        nargs='+',
-        required=True,
-        help='paths to your geoTwitter*.zip files'
-    )
-    parser.add_argument('--print_every', type=int, default=1000)
+    parser.add_argument('--db',required=True)
+    parser.add_argument('--inputs',nargs='+',required=True)
+    parser.add_argument('--print_every',type=int,default=1000)
     args = parser.parse_args()
 
-    # Create the SQLAlchemy engine
-    engine = sqlalchemy.create_engine(
-        args.db,
-        connect_args={'application_name': 'load_tweets.py'}
-    )
+    # create database connection
+    engine = sqlalchemy.create_engine(args.db, connect_args={
+        'application_name': 'load_tweets.py',
+        })
+    connection = engine.connect()
 
-    # One big transaction for everything
-    with engine.begin() as conn:
-        # Reverse sort reduces dead tuples in users table
-        for filename in sorted(args.inputs, reverse=True):
-            print(datetime.datetime.now(), "Loading", filename)
-            with zipfile.ZipFile(filename, 'r') as archive:
-                for subfile in sorted(archive.namelist(), reverse=True):
-                    with io.TextIOWrapper(archive.open(subfile)) as f:
-                        for i, line in enumerate(f):
-                            tweet = json.loads(line)
-                            insert_tweet(conn, tweet)
+    # loop through the input file
+    # NOTE:
+    # we reverse sort the filenames because this results in fewer updates to the users table,
+    # which prevents excessive dead tuples and autovacuums
+    for filename in sorted(args.inputs, reverse=True):
+        with zipfile.ZipFile(filename, 'r') as archive: 
+            print(datetime.datetime.now(),filename)
+            for subfilename in sorted(archive.namelist(), reverse=True):
+                with io.TextIOWrapper(archive.open(subfilename)) as f:
+                    for i,line in enumerate(f):
 
-                            # progress indicator
-                            if i % args.print_every == 0:
-                                print(
-                                    datetime.datetime.now(),
-                                    filename, subfile,
-                                    'i=', i,
-                                    'id=', tweet['id']
-                                )
-    # exiting the with‑block issues a single COMMIT (or rollback on error)
+                        # load and insert the tweet
+                        tweet = json.loads(line)
+                        insert_tweet(connection,tweet)
 
+                        # print message
+                        if i%args.print_every==0:
+                            print(datetime.datetime.now(),filename,subfilename,'i=',i,'id=',tweet['id'])
