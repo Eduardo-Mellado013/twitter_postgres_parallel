@@ -169,6 +169,7 @@ def _insert_tweets(connection,input_tweets):
     tweet_mentions = []
     tweet_tags = []
     tweet_media = []
+    tweet_urls =[]
 
     ######################################## 
     # STEP 1: generate the lists
@@ -294,7 +295,7 @@ def _insert_tweets(connection,input_tweets):
         for url in urls:
             tweet_urls.append({
                 'id_tweets':tweet['id'],
-                'url':remove_nulls(['expanded_url']),
+                'url':remove_nulls(url['expanded_url']),
                 })
 
         ########################################
@@ -352,14 +353,13 @@ def _insert_tweets(connection,input_tweets):
         for medium in media:
             tweet_media.append({
                 'id_tweets':tweet['id'],
-                'url':remove_nulls(['media_url']),
+                'url':remove_nulls(medium['media_url']),
                 'type':medium['type']
                 })
 
     ######################################## 
     # STEP 2: perform the actual SQL inserts
     ######################################## 
-    with connection.begin() as trans:
 
         # use the bulk_insert function to insert most of the data
         bulk_insert(connection, 'users', users)
