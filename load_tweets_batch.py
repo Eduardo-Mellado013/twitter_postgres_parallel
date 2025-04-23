@@ -105,6 +105,8 @@ def _bulk_insert_sql(table, rows):
         '''
         +
         ','.join([ '('+','.join([f':{key}{i}' for key in keys])+')' for i in range(len(rows))])
+        +
+        " ON CONFLICT DO NOTHING"
         )
 
 
@@ -139,12 +141,12 @@ def insert_tweets(connection, tweets, batch_size=1000):
         connection: a sqlalchemy connection to the postgresql db
         input_tweets: a list of dictionaries representing the json tweet objects
     '''
-    for i,tweet_batch in enumerate(batch(tweets, batch_size)):
-        print(datetime.datetime.now(),'insert_tweets i=',i)
-        _insert_tweets(connection, tweet_batch)
+    for i, tweet_batch in enumerate(batch(tweets, batch_size)):
+        print(datetime.datetime.now(), 'insert_tweets batch=', i)
+        with connection.begin():
+            _insert_tweets(connection, tweet_batch)
 
-
-def _insert_tweets(connection,input_tweets):
+def _insert_tweets(connection, input_tweets):
     '''
     Inserts a single batch of tweets into the database.
 
@@ -159,13 +161,13 @@ def _insert_tweets(connection,input_tweets):
     # in the first step, we loop over the input batch and construct the lists;
     # in the second step, we actually insert the lists.
     users = []
-    tweets = []
     users_unhydrated_from_tweets = []
     users_unhydrated_from_mentions = []
     tweet_mentions = []
     tweet_tags = []
     tweet_media = []
     tweet_urls =[]
+    tweets_rows =[]
 
     ######################################## 
     # STEP 1: generate the lists
@@ -352,9 +354,26 @@ def _insert_tweets(connection,input_tweets):
 
     ######################################## 
     # STEP 2: perform the actual SQL inserts
-    ######################################## 
+    ########################################
 
-        # use the bulk_insert function to insert most of the data
+        def dedupe_sort(rows, key='id_users'):
+            seen = set()
+            uniq = []
+            for r in rows:
+                k = r[key]
+                if k not in seen:
+                    seen.add(k)
+                    uniq.append(r)
+            return sorted(uniq, key=lambda r: r[key])
+        
+        users.sort(key=lambda r: r['id_users'])
+        users_unhydrated_from_tweets.sort(key=lambda r: r['id_users'])
+        users_unhydrated_from_mentions.sort(key=lambda r: r['id_users'])
+        tweet_mentions.sort(key=lambda r: (r['id_tweets'], r['id_users']))
+        tweet_tags.sort(key=lambda r: (r['id_tweets'], r['tag']))
+        tweet_media.sort(key=lambda r: (r['id_tweets'], r['url']))
+        tweet_urls.sort(key=lambda r: (r['id_tweets'], r['url']))
+       # use the bulk_insert function to insert most of the data
         bulk_insert(connection, 'users', users)
         bulk_insert(connection, 'users', users_unhydrated_from_tweets)
         bulk_insert(connection, 'users', users_unhydrated_from_mentions)
@@ -378,7 +397,8 @@ def _insert_tweets(connection,input_tweets):
             '''
             +
             ','.join([f"(:id_tweets{i},:id_users{i},:created_at{i},:in_reply_to_status_id{i},:in_reply_to_user_id{i},:quoted_status_id{i},ST_GeomFromText(:geo_str{i} || '(' || :geo_coords{i} || ')'), :retweet_count{i},:quote_count{i},:favorite_count{i},:withheld_copyright{i},:withheld_in_countries{i},:place_name{i},:country_code{i},:state_code{i},:lang{i},:text{i},:source{i})" for i in range(len(tweets))])
-            )
+            +
+            " ON CONFLICT (id_tweets) DO NOTHING")
         res = connection.execute(sql, { key+str(i):value for i,tweet in enumerate(tweets) for key,value in tweet.items() })
 
 
@@ -402,14 +422,13 @@ if __name__ == '__main__':
     # NOTE:
     # we reverse sort the filenames because this results in fewer updates to the users table,
     # which prevents excessive dead tuples and autovacuums
-    with connection.begin() as trans:
-        for filename in sorted(args.inputs, reverse=True):
-            with zipfile.ZipFile(filename, 'r') as archive: 
-                print(datetime.datetime.now(),filename)
-                for subfilename in sorted(archive.namelist(), reverse=True):
-                    with io.TextIOWrapper(archive.open(subfilename)) as f:
-                        tweets = []
-                        for i,line in enumerate(f):
-                            tweet = json.loads(line)
-                            tweets.append(tweet)
-                        insert_tweets(connection,tweets,args.batch_size)
+    for filename in sorted(args.inputs, reverse=True):
+        with zipfile.ZipFile(filename, 'r') as archive: 
+            print(datetime.datetime.now(),filename)
+            for subfilename in sorted(archive.namelist(), reverse=True):
+                with io.TextIOWrapper(archive.open(subfilename)) as f:
+                    tweets = []
+                    for i,line in enumerate(f):
+                        tweet = json.loads(line)
+                        tweets.append(tweet)
+                    insert_tweets(connection,tweets,args.batch_size)
