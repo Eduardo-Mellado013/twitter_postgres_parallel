@@ -3,13 +3,15 @@ CREATE EXTENSION postgis;
 \set ON_ERROR_STOP on
 
 BEGIN;
-/*
- * Users may be partially hydrated with only a name/screen_name 
- * if they are first encountered during a quote/reply/mention 
- * inside of a tweet someone else's tweet.
- */
+
+-- DROP the centralized URLs table entirely
+-- (we no longer use urls or id_urls anywhere)
+DROP TABLE IF EXISTS urls;
+
+-- USERS: remove UNIQUE/PK on id_users, replace id_urls → url TEXT
+DROP TABLE IF EXISTS users;
 CREATE TABLE users (
-    id_users BIGINT PRIMARY KEY,
+    id_users BIGINT,
     created_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ,
     url TEXT,
@@ -25,10 +27,11 @@ CREATE TABLE users (
     description TEXT,
     withheld_in_countries VARCHAR(2)[]
 );
+-- optional non-unique index for lookup
+CREATE INDEX IF NOT EXISTS users_id_idx ON users(id_users);
 
-/*
- * Tweets may be entered in hydrated or unhydrated form.
- */
+-- TWEETS: keep id_tweets as PRIMARY KEY
+DROP TABLE IF EXISTS tweets;
 CREATE TABLE tweets (
     id_tweets BIGINT PRIMARY KEY,
     id_users BIGINT,
@@ -48,78 +51,74 @@ CREATE TABLE tweets (
     lang TEXT,
     place_name TEXT,
     geo geometry,
-    FOREIGN KEY (id_users) REFERENCES users(id_users) DEFERRABLE INITIALLY DEFERRED,
-    FOREIGN KEY (in_reply_to_user_id) REFERENCES users(id_users) DEFERRABLE INITIALLY DEFERRED
-
-    -- NOTE:
-    -- We do not have the following foreign keys because they would require us
-    -- to store many unhydrated tweets in this table.
-    -- FOREIGN KEY (in_reply_to_status_id) REFERENCES tweets(id_tweets),
-    -- FOREIGN KEY (quoted_status_id) REFERENCES tweets(id_tweets)
+    FOREIGN KEY (id_users)            REFERENCES users(id_users)            DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (in_reply_to_user_id) REFERENCES users(id_users)            DEFERRABLE INITIALLY DEFERRED
 );
-CREATE INDEX tweets_index_geo ON tweets USING gist(geo);
+CREATE INDEX tweets_index_geo               ON tweets USING gist(geo);
 CREATE INDEX tweets_index_withheldincountries ON tweets USING gin(withheld_in_countries);
 
+-- TWEET_URLS: remove UNIQUE/PK, replace id_urls→url
+DROP TABLE IF EXISTS tweet_urls;
 CREATE TABLE tweet_urls (
     id_tweets BIGINT,
-    url TEXT,
-    PRIMARY KEY (id_tweets, url),
+    url       TEXT,
     FOREIGN KEY (id_tweets) REFERENCES tweets(id_tweets) DEFERRABLE INITIALLY DEFERRED
 );
+CREATE INDEX IF NOT EXISTS tweet_urls_tweetid_idx ON tweet_urls(id_tweets);
 
-
+-- TWEET_MENTIONS: remove UNIQUE/PK
+DROP TABLE IF EXISTS tweet_mentions;
 CREATE TABLE tweet_mentions (
     id_tweets BIGINT,
-    id_users BIGINT,
-    PRIMARY KEY (id_tweets, id_users),
+    id_users  BIGINT,
     FOREIGN KEY (id_tweets) REFERENCES tweets(id_tweets) DEFERRABLE INITIALLY DEFERRED,
-    FOREIGN KEY (id_users) REFERENCES users(id_users) DEFERRABLE INITIALLY DEFERRED
+    FOREIGN KEY (id_users)  REFERENCES users(id_users)   DEFERRABLE INITIALLY DEFERRED
 );
-CREATE INDEX tweet_mentions_index ON tweet_mentions(id_users);
+CREATE INDEX IF NOT EXISTS tweet_mentions_idx_t ON tweet_mentions(id_tweets);
+CREATE INDEX IF NOT EXISTS tweet_mentions_idx_u ON tweet_mentions(id_users);
 
+-- TWEET_TAGS: remove UNIQUE/PK
+DROP TABLE IF EXISTS tweet_tags;
 CREATE TABLE tweet_tags (
     id_tweets BIGINT,
-    tag TEXT,
-    PRIMARY KEY (id_tweets, tag),
+    tag       TEXT,
     FOREIGN KEY (id_tweets) REFERENCES tweets(id_tweets) DEFERRABLE INITIALLY DEFERRED
 );
-COMMENT ON TABLE tweet_tags IS 'This table links both hashtags and cashtags';
-CREATE INDEX tweet_tags_index ON tweet_tags(id_tweets);
+CREATE INDEX IF NOT EXISTS tweet_tags_idx_t ON tweet_tags(id_tweets);
 
-
+-- TWEET_MEDIA: remove UNIQUE/PK, replace id_urls→url
+DROP TABLE IF EXISTS tweet_media;
 CREATE TABLE tweet_media (
     id_tweets BIGINT,
-    url TEXT,
-    type TEXT,
-    PRIMARY KEY (id_tweets, url),
+    url       TEXT,
+    type      TEXT,
     FOREIGN KEY (id_tweets) REFERENCES tweets(id_tweets) DEFERRABLE INITIALLY DEFERRED
 );
+CREATE INDEX IF NOT EXISTS tweet_media_idx_t ON tweet_media(id_tweets);
 
-/*
- * Precomputes the total number of occurrences for each hashtag
- */
+-- MATERIALIZED VIEWS (unchanged)
+DROP MATERIALIZED VIEW IF EXISTS tweet_tags_total;
 CREATE MATERIALIZED VIEW tweet_tags_total AS (
-    SELECT 
-        row_number() over (order by count(*) desc) AS row,
-        tag, 
+    SELECT
+        row_number() OVER (ORDER BY count(*) DESC) AS row,
+        tag,
         count(*) AS total
     FROM tweet_tags
     GROUP BY tag
     ORDER BY total DESC
 );
 
-/*
- * Precomputes the number of hashtags that co-occur with each other
- */
+DROP MATERIALIZED VIEW IF EXISTS tweet_tags_cooccurrence;
 CREATE MATERIALIZED VIEW tweet_tags_cooccurrence AS (
-    SELECT 
+    SELECT
         t1.tag AS tag1,
         t2.tag AS tag2,
         count(*) AS total
     FROM tweet_tags t1
-    INNER JOIN tweet_tags t2 ON t1.id_tweets = t2.id_tweets
+    JOIN tweet_tags t2 ON t1.id_tweets = t2.id_tweets
     GROUP BY t1.tag, t2.tag
     ORDER BY total DESC
 );
 
 COMMIT;
+
