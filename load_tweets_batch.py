@@ -38,6 +38,33 @@ def remove_nulls(s):
         return s.replace('\x00','\\x00')
 
 
+def get_id_urls(url):
+    '''
+    Given a url, returns the corresponding id in the urls table.
+    If no row exists for the url, then one is inserted automatically.
+    '''
+    sql = sqlalchemy.sql.text('''
+    insert into urls 
+        (url)
+        values
+        (:url)
+    on conflict do nothing
+    returning id_urls
+    ;
+    ''')
+    res = connection.execute(sql,{'url':url}).first()
+    if res is None:
+        sql = sqlalchemy.sql.text('''
+        select id_urls 
+        from urls
+        where
+            url=:url
+        ''')
+        res = connection.execute(sql,{'url':url}).first()
+    id_urls = res[0]
+    return id_urls
+
+
 def batch(iterable, n=1):
     '''
     Group an iterable into batches of size n.
@@ -69,10 +96,10 @@ def _bulk_insert_sql(table, rows):
     The first entry is the SQL text, and the second entry is the dictionary of bind parameters.
 
     >>> _bulk_insert_sql('test', [{'message': 'hello world', 'id': 5}])
-    ('INSERT INTO test (message,id) VALUES (:message0,:id0), {'message0': 'hello world', 'id0': 5})
+    ('INSERT INTO test (message,id) VALUES (:message0,:id0) ON CONFLICT DO NOTHING', {'message0': 'hello world', 'id0': 5})
 
     >>> _bulk_insert_sql('test', [{'message': 'hello world', 'id': 5}, {'message': 'goodbye world', 'id':6}])[0]
-    'INSERT INTO test (message,id) VALUES (:message0,:id0),(:message1,:id1) '
+    'INSERT INTO test (message,id) VALUES (:message0,:id0),(:message1,:id1) ON CONFLICT DO NOTHING'
 
     >>> _bulk_insert_sql('test', [{'message': 'hello world', 'id': 5}, {'message': 'goodbye world', 'id':6}])[1]
     {'message0': 'hello world', 'id0': 5, 'message1': 'goodbye world', 'id1': 6}
@@ -106,7 +133,9 @@ def _bulk_insert_sql(table, rows):
         +
         ','.join([ '('+','.join([f':{key}{i}' for key in keys])+')' for i in range(len(rows))])
         +
-        " ON CONFLICT DO NOTHING"
+        '''
+        ON CONFLICT DO NOTHING
+        '''
         )
 
 
@@ -141,12 +170,12 @@ def insert_tweets(connection, tweets, batch_size=1000):
         connection: a sqlalchemy connection to the postgresql db
         input_tweets: a list of dictionaries representing the json tweet objects
     '''
-    for i, tweet_batch in enumerate(batch(tweets, batch_size)):
-        print(datetime.datetime.now(), 'insert_tweets batch=', i)
-        with connection.begin():
-            _insert_tweets(connection, tweet_batch)
+    for i,tweet_batch in enumerate(batch(tweets, batch_size)):
+        print(datetime.datetime.now(),'insert_tweets i=',i)
+        _insert_tweets(connection, tweet_batch)
 
-def _insert_tweets(connection, input_tweets):
+
+def _insert_tweets(connection,input_tweets):
     '''
     Inserts a single batch of tweets into the database.
 
@@ -161,22 +190,26 @@ def _insert_tweets(connection, input_tweets):
     # in the first step, we loop over the input batch and construct the lists;
     # in the second step, we actually insert the lists.
     users = []
+    tweets = []
     users_unhydrated_from_tweets = []
     users_unhydrated_from_mentions = []
     tweet_mentions = []
     tweet_tags = []
     tweet_media = []
-    tweet_urls =[]
-    tweets_rows =[]
+    tweet_urls = []
 
     ######################################## 
     # STEP 1: generate the lists
     ######################################## 
     for tweet in input_tweets:
 
-        #######################################
+        ########################################
         # insert into the users table
-        #######################################
+        ########################################
+        if tweet['user']['url'] is None:
+            user_id_urls = None
+        else:
+            user_id_urls = get_id_urls(tweet['user']['url'])
 
         users.append({
             'id_users':tweet['user']['id'],
@@ -185,6 +218,7 @@ def _insert_tweets(connection, input_tweets):
             'screen_name':remove_nulls(tweet['user']['screen_name']),
             'name':remove_nulls(tweet['user']['name']),
             'location':remove_nulls(tweet['user']['location']),
+            'id_urls':user_id_urls,
             'description':remove_nulls(tweet['user']['description']),
             'protected':tweet['user']['protected'],
             'verified':tweet['user']['verified'],
@@ -192,7 +226,7 @@ def _insert_tweets(connection, input_tweets):
             'listed_count':tweet['user']['listed_count'],
             'favourites_count':tweet['user']['favourites_count'],
             'statuses_count':tweet['user']['statuses_count'],
-            'withheld_in_countries':tweet['user'].get('withheld_in_countries',None)
+            'withheld_in_countries':tweet['user'].get('withheld_in_countries',None),
             })
 
         ########################################
@@ -256,7 +290,7 @@ def _insert_tweets(connection, input_tweets):
                 })
 
         # insert the tweet
-        tweets_rows.append({
+        tweets.append({
             'id_tweets':tweet['id'],
             'id_users':tweet['user']['id'],
             'created_at':tweet['created_at'],
@@ -288,9 +322,10 @@ def _insert_tweets(connection, input_tweets):
             urls = tweet['entities']['urls']
 
         for url in urls:
+            id_urls = get_id_urls(url['expanded_url'])
             tweet_urls.append({
                 'id_tweets':tweet['id'],
-                'url':remove_nulls(url['expanded_url']),
+                'id_urls':id_urls,
                 })
 
         ########################################
@@ -346,34 +381,19 @@ def _insert_tweets(connection, input_tweets):
                 media = []
 
         for medium in media:
+            id_urls = get_id_urls(medium['media_url'])
             tweet_media.append({
                 'id_tweets':tweet['id'],
-                'url':remove_nulls(medium['media_url']),
+                'id_urls':id_urls,
                 'type':medium['type']
                 })
 
     ######################################## 
     # STEP 2: perform the actual SQL inserts
-    ########################################
+    ######################################## 
+    with connection.begin() as trans:
 
-        def dedupe_sort(rows, key='id_users'):
-            seen = set()
-            uniq = []
-            for r in rows:
-                k = r[key]
-                if k not in seen:
-                    seen.add(k)
-                    uniq.append(r)
-            return sorted(uniq, key=lambda r: r[key])
-        
-        users.sort(key=lambda r: r['id_users'])
-        users_unhydrated_from_tweets.sort(key=lambda r: r['id_users'])
-        users_unhydrated_from_mentions.sort(key=lambda r: r['id_users'])
-        tweet_mentions.sort(key=lambda r: (r['id_tweets'], r['id_users']))
-        tweet_tags.sort(key=lambda r: (r['id_tweets'], r['tag']))
-        tweet_media.sort(key=lambda r: (r['id_tweets'], r['url']))
-        tweet_urls.sort(key=lambda r: (r['id_tweets'], r['url']))
-       # use the bulk_insert function to insert most of the data
+        # use the bulk_insert function to insert most of the data
         bulk_insert(connection, 'users', users)
         bulk_insert(connection, 'users', users_unhydrated_from_tweets)
         bulk_insert(connection, 'users', users_unhydrated_from_mentions)
@@ -390,66 +410,20 @@ def _insert_tweets(connection, input_tweets):
         # it makes your python code much more complicated,
         # and is also bad for performance;
         # I'm doing it here just to help illustrate the problems
-
-        tweet_rows = tweets
-        if tweet_rows:
-            n = len(tweet_rows)
-
-        # build exactly n value-tuples, using the same index everywhere
-            values_sql = ", ".join(
-                f"(:id_tweets{i},"
-                f":id_users{i},"
-                f":created_at{i},"
-                f":in_reply_to_status_id{i},"
-                f":in_reply_to_user_id{i},"
-                f":quoted_status_id{i},"
-                f"ST_GeomFromText(:geo_str{i} || '(' || :geo_coords{i} || ')'),"
-                f":retweet_count{i},"
-                f":quote_count{i},"
-                f":favorite_count{i},"
-                f":withheld_copyright{i},"
-                f":withheld_in_countries{i},"
-                f":place_name{i},"
-                f":country_code{i},"
-                f":state_code{i},"
-                f":lang{i},"
-                f":text{i},"
-                f":source{i})"
-                for i in range(n)
+        sql = sqlalchemy.sql.text('''
+        INSERT INTO tweets
+            (id_tweets,id_users,created_at,in_reply_to_status_id,in_reply_to_user_id,quoted_status_id,geo,retweet_count,quote_count,favorite_count,withheld_copyright,withheld_in_countries,place_name,country_code,state_code,lang,text,source)
+            VALUES
+            '''
+            +
+            ','.join([f"(:id_tweets{i},:id_users{i},:created_at{i},:in_reply_to_status_id{i},:in_reply_to_user_id{i},:quoted_status_id{i},ST_GeomFromText(:geo_str{i} || '(' || :geo_coords{i} || ')'), :retweet_count{i},:quote_count{i},:favorite_count{i},:withheld_copyright{i},:withheld_in_countries{i},:place_name{i},:country_code{i},:state_code{i},:lang{i},:text{i},:source{i})" for i in range(len(tweets))])
+            +
+            '''
+            ON CONFLICT DO NOTHING
+            '''
             )
+        res = connection.execute(sql, { key+str(i):value for i,tweet in enumerate(tweets) for key,value in tweet.items() })
 
-            sql = sqlalchemy.sql.text(f"""
-                INSERT INTO tweets (
-                    id_tweets,
-                    id_users,
-                    created_at,
-                    in_reply_to_status_id,
-                    in_reply_to_user_id,
-                    quoted_status_id,
-                    geo,
-                    retweet_count,
-                    quote_count,
-                    favorite_count,
-                    withheld_copyright,
-                    withheld_in_countries,
-                    place_name,
-                    country_code,
-                    state_code,
-                    lang,
-                    text,
-                    source
-                ) VALUES
-                {values_sql}
-                ON CONFLICT (id_tweets) DO NOTHING
-                """)
-
-            # build binds from the *same* tweet_rows list
-            binds = {
-                f"{col}{i}": val
-                for i, row in enumerate(tweet_rows)
-                for col, val in row.items()
-            }
-            connection.execute(sql, binds)
 
 if __name__ == '__main__':
 
@@ -471,13 +445,14 @@ if __name__ == '__main__':
     # NOTE:
     # we reverse sort the filenames because this results in fewer updates to the users table,
     # which prevents excessive dead tuples and autovacuums
-    for filename in sorted(args.inputs, reverse=True):
-        with zipfile.ZipFile(filename, 'r') as archive: 
-            print(datetime.datetime.now(),filename)
-            for subfilename in sorted(archive.namelist(), reverse=True):
-                with io.TextIOWrapper(archive.open(subfilename)) as f:
-                    tweets = []
-                    for i,line in enumerate(f):
-                        tweet = json.loads(line)
-                        tweets.append(tweet)
-                    insert_tweets(connection,tweets,args.batch_size)
+    with connection.begin() as trans:
+        for filename in sorted(args.inputs, reverse=True):
+            with zipfile.ZipFile(filename, 'r') as archive: 
+                print(datetime.datetime.now(),filename)
+                for subfilename in sorted(archive.namelist(), reverse=True):
+                    with io.TextIOWrapper(archive.open(subfilename)) as f:
+                        tweets = []
+                        for i,line in enumerate(f):
+                            tweet = json.loads(line)
+                            tweets.append(tweet)
+                        insert_tweets(connection,tweets,args.batch_size)
