@@ -191,7 +191,7 @@ def _insert_tweets(connection,input_tweets):
             'listed_count':tweet['user']['listed_count'],
             'favourites_count':tweet['user']['favourites_count'],
             'statuses_count':tweet['user']['statuses_count'],
-            'withheld_in_countries':tweet['user'].get('withheld_in_countries',None),
+            'withheld_in_countries':tweet['user'].get('withheld_in_countries',None)
             })
 
         ########################################
