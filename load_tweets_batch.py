@@ -390,22 +390,66 @@ def _insert_tweets(connection, input_tweets):
         # it makes your python code much more complicated,
         # and is also bad for performance;
         # I'm doing it here just to help illustrate the problems
-        count = len(tweets)
-        sql = sqlalchemy.sql.text('''
-        INSERT INTO tweets
-            (id_tweets,id_users,created_at,in_reply_to_status_id,in_reply_to_user_id,quoted_status_id,geo,retweet_count,quote_count,favorite_count,withheld_copyright,withheld_in_countries,place_name,country_code,state_code,lang,text,source)
-            VALUES
-            '''
-            +
-            ','.join([f"(:id_tweets{i},:id_users{i},:created_at{i},:in_reply_to_status_id{i},:in_reply_to_user_id{i},:quoted_status_id{i},ST_GeomFromText(:geo_str{i} || '(' || :geo_coords{i} || ')'), :retweet_count{i},:quote_count{i},:favorite_count{i},:withheld_copyright{i},:withheld_in_countries{i},:place_name{i},:country_code{i},:state_code{i},:lang{i},:text{i},:source{i})" for i in range(count)])
-            +
-            " ON CONFLICT (id_tweets) DO NOTHING")
-        binds = {
-            f"{col}{i}": val
-            for i, row in enumerate(tweets)
-            for col, val in row.items()}
-        res = connection.execute(sql, binds)
 
+        tweet_rows = tweets
+        if tweet_rows:
+            n = len(tweet_rows)
+
+        # build exactly n value-tuples, using the same index everywhere
+            values_sql = ", ".join(
+                f"(:id_tweets{i},"
+                f":id_users{i},"
+                f":created_at{i},"
+                f":in_reply_to_status_id{i},"
+                f":in_reply_to_user_id{i},"
+                f":quoted_status_id{i},"
+                f"ST_GeomFromText(:geo_str{i} || '(' || :geo_coords{i} || ')'),"
+                f":retweet_count{i},"
+                f":quote_count{i},"
+                f":favorite_count{i},"
+                f":withheld_copyright{i},"
+                f":withheld_in_countries{i},"
+                f":place_name{i},"
+                f":country_code{i},"
+                f":state_code{i},"
+                f":lang{i},"
+                f":text{i},"
+                f":source{i})"
+                for i in range(n)
+            )
+
+            sql = sqlalchemy.sql.text(f"""
+                INSERT INTO tweets (
+                    id_tweets,
+                    id_users,
+                    created_at,
+                    in_reply_to_status_id,
+                    in_reply_to_user_id,
+                    quoted_status_id,
+                    geo,
+                    retweet_count,
+                    quote_count,
+                    favorite_count,
+                    withheld_copyright,
+                    withheld_in_countries,
+                    place_name,
+                    country_code,
+                    state_code,
+                    lang,
+                    text,
+                    source
+                ) VALUES
+                {values_sql}
+                ON CONFLICT (id_tweets) DO NOTHING
+                """)
+
+            # build binds from the *same* tweet_rows list
+            binds = {
+                f"{col}{i}": val
+                for i, row in enumerate(tweet_rows)
+                for col, val in row.items()
+            }
+            connection.execute(sql, binds)
 
 if __name__ == '__main__':
 
