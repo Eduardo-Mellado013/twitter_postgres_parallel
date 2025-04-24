@@ -1,9 +1,6 @@
 #!/usr/bin/python3
 
-# imports
-import psycopg2
 import sqlalchemy
-import os
 import datetime
 import zipfile
 import io
@@ -14,100 +11,58 @@ import json
 ################################################################################
 
 def remove_nulls(s):
-    r'''
-    Postgres doesn't support strings with the null character \x00 in them, but twitter does.
-    This helper function replaces the null characters with an escaped version so that they can be loaded into postgres.
-    Technically, this means the data in postgres won't be an exact match of the data in twitter,
-    and there is no way to get the original twitter data back from the data in postgres.
-
-    The null character is extremely rarely used in real world text (approx. 1 in 1 billion tweets),
-    and so this isn't too big of a deal.
-    A more correct implementation, however, would be to *escape* the null characters rather than remove them.
-    This isn't hard to do in python, but it is a bit of a pain to do with the JSON/COPY commands for the denormalized data.
-    Since our goal is for the normalized/denormalized versions of the data to match exactly,
-    we're not going to escape the strings for the normalized data.
-
-    >>> remove_nulls('\x00')
-    '\\x00'
-    >>> remove_nulls('hello\x00 world')
-    'hello\\x00 world'
-    '''
     if s is None:
         return None
-    else:
-        return s.replace('\x00','\\x00')
-
+    return s.replace('\x00', '\\x00')
 
 def batch(iterable, n=1):
-    '''
-    Group an iterable into batches of size n.
-
-    >>> list(batch([1,2,3,4,5], 2))
-    [[1, 2], [3, 4], [5]]
-    >>> list(batch([1,2,3,4,5,6], 2))
-    [[1, 2], [3, 4], [5, 6]]
-    >>> list(batch([1,2,3,4,5], 3))
-    [[1, 2, 3], [4, 5]]
-    >>> list(batch([1,2,3,4,5,6], 3))
-    [[1, 2, 3], [4, 5, 6]]
-    '''
     l = len(iterable)
     for ndx in range(0, l, n):
         yield iterable[ndx:min(ndx + n, l)]
 
-
 def _bulk_insert_sql(table, rows):
-    '''
-    This function generates the SQL for a bulk insert.
-    It is not intended to be called directly,
-    but is a helper for the bulk_insert function.
-    ... (docstring truncated for brevity) ...
-    '''
     if not rows:
         raise ValueError('Must be at least one dictionary in the rows variable')
-    else:
-        keys = set(rows[0].keys())
-        for row in rows:
-            if set(row.keys()) != keys:
-                raise ValueError('All dictionaries must contain the same keys')
-    sql = (f'''
-    INSERT INTO {table}
-        (''' + ','.join(keys) + ''')
-        VALUES
-        ''' + ','.join([ '('+','.join([f':{key}{i}' for key in keys])+')' for i in range(len(rows))]) + '''
-        ON CONFLICT DO NOTHING
-        ''')
+    keys = set(rows[0].keys())
+    for row in rows:
+        if set(row.keys()) != keys:
+            raise ValueError('All dictionaries must contain the same keys')
 
-    binds = { key+str(i):value for i,row in enumerate(rows) for key,value in row.items() }
+    cols = ','.join(keys)
+    placeholders = ','.join(
+        '(' + ','.join(f':{key}{i}' for key in keys) + ')'
+        for i in range(len(rows))
+    )
+    sql = f"""
+        INSERT INTO {table} ({cols})
+        VALUES {placeholders}
+        ON CONFLICT DO NOTHING
+    """
+    binds = { f"{key}{i}": value
+              for i,row in enumerate(rows)
+              for key,value in row.items() }
     return (' '.join(sql.split()), binds)
 
-
 def bulk_insert(connection, table, rows):
-    '''
-    Insert the data contained in the `rows` variable into the `table` relation.
-    '''
-    if len(rows) == 0:
+    if not rows:
         return
     sql, binds = _bulk_insert_sql(table, rows)
     connection.execute(sqlalchemy.sql.text(sql), binds)
 
 ################################################################################
-# main functions
+# main loader functions
 ################################################################################
 
 def insert_tweets(connection, tweets, batch_size=1000):
-    '''
-    Efficiently inserts many tweets into the database.
-    '''
+    """
+    Splits tweets into batches and inserts each batch
+    within the outer transaction managed by __main__.
+    """
     for i, tweet_batch in enumerate(batch(tweets, batch_size)):
-        print(datetime.datetime.now(), 'insert_tweets i=', i)
+        print(datetime.datetime.now(), 'insert_tweets batch=', i)
         _insert_tweets(connection, tweet_batch)
 
-
 def _insert_tweets(connection, input_tweets):
-    '''
-    Inserts a single batch of tweets into the database.
-    '''
     users = []
     tweets = []
     users_unhydrated_from_tweets = []
@@ -117,11 +72,9 @@ def _insert_tweets(connection, input_tweets):
     tweet_media = []
     tweet_urls = []
 
-    ########################################
-    # STEP 1: generate the lists
-    ########################################
+    # STEP 1: build row-dicts
     for tweet in input_tweets:
-        # --- USERS ---
+        # USERS
         users.append({
             'id_users': tweet['user']['id'],
             'created_at': tweet['user']['created_at'],
@@ -140,20 +93,18 @@ def _insert_tweets(connection, input_tweets):
             'withheld_in_countries': tweet['user'].get('withheld_in_countries', None),
         })
 
-        # --- TWEETS ---
-        # (geo parsing and text extraction same as before)
+        # TWEETS (geo + text)
         try:
-            geo_coords = tweet['geo']['coordinates']
-            geo_coords = f"{geo_coords[0]} {geo_coords[1]}"
+            coords = tweet['geo']['coordinates']
+            geo_coords = f"{coords[0]} {coords[1]}"
             geo_str = 'POINT'
-        except TypeError:
-            # (polygon parsing omitted for brevity)
-            geo_str = None
+        except Exception:
             geo_coords = None
+            geo_str = None
 
         try:
             text = tweet['extended_tweet']['full_text']
-        except:
+        except KeyError:
             text = tweet['text']
 
         country_code = None
@@ -165,7 +116,8 @@ def _insert_tweets(connection, input_tweets):
         state_code = None
         if country_code == 'us':
             sc = tweet['place']['full_name'].split(',')[-1].strip().lower()
-            state_code = sc if len(sc) <= 2 else None
+            if len(sc) <= 2:
+                state_code = sc
 
         place_name = None
         try:
@@ -173,129 +125,134 @@ def _insert_tweets(connection, input_tweets):
         except Exception:
             pass
 
-        if tweet.get('in_reply_to_user_id', None) is not None:
+        # handle unhydrated reply-users
+        if tweet.get('in_reply_to_user_id') is not None:
             users_unhydrated_from_tweets.append({
                 'id_users': tweet['in_reply_to_user_id'],
-                'screen_name': remove_nulls(tweet['in_reply_to_screen_name']),
+                'screen_name': remove_nulls(tweet.get('in_reply_to_screen_name'))
             })
 
         tweets.append({
             'id_tweets': tweet['id'],
             'id_users': tweet['user']['id'],
             'created_at': tweet['created_at'],
-            'in_reply_to_status_id': tweet.get('in_reply_to_status_id', None),
-            'in_reply_to_user_id': tweet.get('in_reply_to_user_id', None),
-            'quoted_status_id': tweet.get('quoted_status_id', None),
-            'geo_coords': geo_coords,
+            'in_reply_to_status_id': tweet.get('in_reply_to_status_id'),
+            'in_reply_to_user_id': tweet.get('in_reply_to_user_id'),
+            'quoted_status_id': tweet.get('quoted_status_id'),
             'geo_str': geo_str,
-            'retweet_count': tweet.get('retweet_count', None),
-            'quote_count': tweet.get('quote_count', None),
-            'favorite_count': tweet.get('favorite_count', None),
-            'withheld_copyright': tweet.get('withheld_copyright', None),
-            'withheld_in_countries': tweet.get('withheld_in_countries', None),
+            'geo_coords': geo_coords,
+            'retweet_count': tweet.get('retweet_count'),
+            'quote_count': tweet.get('quote_count'),
+            'favorite_count': tweet.get('favorite_count'),
+            'withheld_copyright': tweet.get('withheld_copyright'),
+            'withheld_in_countries': tweet.get('withheld_in_countries'),
             'place_name': place_name,
             'country_code': country_code,
             'state_code': state_code,
             'lang': tweet.get('lang'),
             'text': remove_nulls(text),
-            'source': remove_nulls(tweet.get('source', None)),
+            'source': remove_nulls(tweet.get('source'))
         })
 
-        # --- TWEET_URLS ---
-        try:
-            urls = tweet['extended_tweet']['entities']['urls']
-        except KeyError:
-            urls = tweet['entities']['urls']
-        for url_obj in urls:
+        # TWEET_URLS
+        urls = tweet.get('extended_tweet', {}).get('entities', {}).get('urls',
+               tweet['entities']['urls'])
+        for u in urls:
             tweet_urls.append({
                 'id_tweets': tweet['id'],
-                'url': remove_nulls(url_obj['expanded_url']),
+                'url': remove_nulls(u['expanded_url'])
             })
 
-        # --- TWEET_MENTIONS ---
-        try:
-            mentions = tweet['extended_tweet']['entities']['user_mentions']
-        except KeyError:
-            mentions = tweet['entities']['user_mentions']
-        for mention in mentions:
+        # TWEET_MENTIONS
+        mentions = tweet.get('extended_tweet', {}).get('entities', {}).get('user_mentions',
+                   tweet['entities']['user_mentions'])
+        for m in mentions:
             users_unhydrated_from_mentions.append({
-                'id_users': mention['id'],
-                'name': remove_nulls(mention['name']),
-                'screen_name': remove_nulls(mention['screen_name']),
+                'id_users': m['id'],
+                'name': remove_nulls(m['name']),
+                'screen_name': remove_nulls(m['screen_name'])
             })
             tweet_mentions.append({
                 'id_tweets': tweet['id'],
-                'id_users': mention['id'],
+                'id_users': m['id']
             })
 
-        # --- TWEET_TAGS ---
-        try:
-            hashtags = tweet['extended_tweet']['entities']['hashtags']
-            cashtags = tweet['extended_tweet']['entities']['symbols']
-        except KeyError:
-            hashtags = tweet['entities']['hashtags']
-            cashtags = tweet['entities']['symbols']
-        tags = ['#' + h['text'] for h in hashtags] + ['$' + c['text'] for c in cashtags]
+        # TWEET_TAGS
+        hashtags = tweet.get('extended_tweet', {}).get('entities', {}).get('hashtags',
+                   tweet['entities']['hashtags'])
+        cashtags = tweet.get('extended_tweet', {}).get('entities', {}).get('symbols',
+                   tweet['entities']['symbols'])
+        tags = [f"#{h['text']}" for h in hashtags] + [f"${c['text']}" for c in cashtags]
         for tag in tags:
             tweet_tags.append({
                 'id_tweets': tweet['id'],
-                'tag': remove_nulls(tag),
+                'tag': remove_nulls(tag)
             })
 
-        # --- TWEET_MEDIA ---
-        try:
-            media = tweet['extended_tweet']['extended_entities']['media']
-        except KeyError:
-            try:
-                media = tweet['extended_entities']['media']
-            except KeyError:
-                media = []
-        for medium in media:
+        # TWEET_MEDIA
+        media = tweet.get('extended_tweet', {}).get('extended_entities', {}).get('media',
+                tweet.get('extended_entities', {}).get('media', []))
+        for m in media:
             tweet_media.append({
                 'id_tweets': tweet['id'],
-                'url': remove_nulls(medium['media_url']),
-                'type': medium['type'],
+                'url': remove_nulls(m['media_url']),
+                'type': m['type']
             })
 
-    ########################################
-    # STEP 2: perform the actual SQL inserts
-    ########################################
-    with connection.begin() as trans:
-        bulk_insert(connection, 'users', users)
-        bulk_insert(connection, 'users', users_unhydrated_from_tweets)
-        bulk_insert(connection, 'users', users_unhydrated_from_mentions)
-        bulk_insert(connection, 'tweet_mentions', tweet_mentions)
-        bulk_insert(connection, 'tweet_tags', tweet_tags)
-        bulk_insert(connection, 'tweet_media', tweet_media)
-        bulk_insert(connection, 'tweet_urls', tweet_urls)
+    # STEP 2: bulk-insert all lists in a single outer transaction
+    bulk_insert(connection, 'users', users)
+    bulk_insert(connection, 'users', users_unhydrated_from_tweets)
+    bulk_insert(connection, 'users', users_unhydrated_from_mentions)
+    bulk_insert(connection, 'tweet_mentions', tweet_mentions)
+    bulk_insert(connection, 'tweet_tags', tweet_tags)
+    bulk_insert(connection, 'tweet_media', tweet_media)
+    bulk_insert(connection, 'tweet_urls', tweet_urls)
 
-        # Tweets require special handling for geo
-        sql = sqlalchemy.sql.text(
-            'INSERT INTO tweets'
-            ' (id_tweets,id_users,created_at,in_reply_to_status_id,in_reply_to_user_id,quoted_status_id,geo,retweet_count,quote_count,favorite_count,withheld_copyright,withheld_in_countries,place_name,country_code,state_code,lang,text,source)'
-            ' VALUES ' +
-            ','.join([f"(:id_tweets{i},:id_users{i},:created_at{i},:in_reply_to_status_id{i},:in_reply_to_user_id{i},:quoted_status_id{i},ST_GeomFromText(:geo_str{i} || '(' || :geo_coords{i} || ')'),:retweet_count{i},:quote_count{i},:favorite_count{i},:withheld_copyright{i},:withheld_in_countries{i},:place_name{i},:country_code{i},:state_code{i},:lang{i},:text{i},:source{i})" for i in range(len(tweets))]) +
-            ' ON CONFLICT DO NOTHING'
+    # Tweets need ST_GeomFromText on insertion
+    sql = sqlalchemy.sql.text(
+        "INSERT INTO tweets "
+        "(id_tweets,id_users,created_at,in_reply_to_status_id,in_reply_to_user_id,"
+        "quoted_status_id,geo,retweet_count,quote_count,favorite_count,"
+        "withheld_copyright,withheld_in_countries,place_name,country_code,"
+        "state_code,lang,text,source) VALUES "
+        + ",".join(
+            f"(:id_tweets{i},:id_users{i},:created_at{i},:in_reply_to_status_id{i},"
+            f":in_reply_to_user_id{i},:quoted_status_id{i},"
+            f"ST_GeomFromText(:geo_str{i} || '(' || :geo_coords{i} || ')'),"
+            f":retweet_count{i},:quote_count{i},:favorite_count{i},"
+            f":withheld_copyright{i},:withheld_in_countries{i},"
+            f":place_name{i},:country_code{i},:state_code{i},:lang{i},"
+            f":text{i},:source{i})"
+            for i in range(len(tweets))
         )
-        connection.execute(sql, {key+str(i): value for i, tweet in enumerate(tweets) for key, value in tweet.items()})
+        + " ON CONFLICT DO NOTHING"
+    )
+    binds = { f"{key}{i}": value
+              for i, tw in enumerate(tweets)
+              for key, value in tw.items() }
+    connection.execute(sql, binds)
+
 
 if __name__ == '__main__':
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--db', required=True)
     parser.add_argument('--inputs', nargs='+', required=True)
     parser.add_argument('--batch_size', type=int, default=1000)
     args = parser.parse_args()
 
-    engine = sqlalchemy.create_engine(args.db, connect_args={
-        'application_name': 'load_tweets_batch.py --inputs ' + ' '.join(args.inputs),
-    })
+    engine = sqlalchemy.create_engine(
+        args.db,
+        connect_args={'application_name': 'load_tweets_batch.py'}
+    )
     connection = engine.connect()
 
-    with connection.begin() as trans:
+    # ONE outer transaction: each file’s worth of batches runs within this
+    with connection.begin():
         for filename in sorted(args.inputs, reverse=True):
+            print(datetime.datetime.now(), filename)
             with zipfile.ZipFile(filename, 'r') as archive:
-                print(datetime.datetime.now(), filename)
                 for subfilename in sorted(archive.namelist(), reverse=True):
                     with io.TextIOWrapper(archive.open(subfilename)) as f:
                         tweets = [json.loads(line) for line in f]
