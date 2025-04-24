@@ -6,16 +6,16 @@ echo '==========================================================================
 echo 'load pg_denormalized'
 echo '================================================================================'
 
-time parallel ./load_denormalized.sh {} ::: $files
+time parallel -j 10 ./load_denormalized.sh {} ::: $files
 
 echo '================================================================================'
 echo 'load pg_normalized'
 echo '================================================================================'
 
-time parallel ./load_normalized.sh {} ::: $files
+time parallel -j 10 ./load_normalized.sh {} ::: $files
 
 echo '================================================================================'
 echo 'load pg_normalized_batch'
 echo '================================================================================'
 
-time parallel ./load_normalized_batch.sh {} ::: $files
+time parallel -j 10 ./load_normalized_batch.sh {} ::: $files
